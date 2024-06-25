@@ -1,0 +1,596 @@
+#include <WiFi.h>
+#include <esp_partition.h>
+#include <esp_spi_flash.h>
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <HTTPClient.h>
+#include <TroykaMQ.h>
+//#include <NTPClient.h>
+//#include <WiFiUdp.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME680.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <GyverOLED.h>
+
+
+
+#define PIN_MQ2 36
+
+#define BME_SDA 21               // Определение пина SDA для подключения BME680
+#define BME_SCL 22               // Определение пина SCL для подключения BME680
+
+#define LengthData 25
+#define LengthDataKey 50
+
+
+MQ2 mq2(PIN_MQ2);
+
+Adafruit_BME680 bme;
+GyverOLED<SSD1306_128x64, OLED_BUFFER> oled; 
+
+
+String urlSend = "http://192.168.63.162/dipib/Send_data.php";
+String urlGet = "http://192.168.63.162/dipib/getKey.php?id=2";
+
+
+const char *ssid     = "F5";
+const char *password = "1122334455";
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
+
+byte counter = 0;
+
+void setup() {
+  Serial.begin(921600);
+  Serial.println("Start");
+  mq2.calibrate();
+  Wire.begin(BME_SDA, BME_SCL);   // Инициализация I2C с указанными пинами SDA и SCL
+  oled.init();
+  oled.setCursor(0, 2);
+  oled.setScale(2);
+  oled.print("НАСТРОЙКА");
+  oled.setCursor(0, 5);
+  oled.print("ПРИБОРА");
+  oled.update();
+
+  
+  if (!bme.begin(0x77)) {         // Попытка инициализации датчика BME680 с адресом 0x76
+    Serial.println("Sensor bme680 is not finded");  // Вывод сообщения об ошибке
+    //while (1);                     // Зависание программы в случае ошибки
+  }
+
+      // Connect to Wi-Fi
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  int counter_for_wifi = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    counter_for_wifi++;
+    counter = 0;
+    if(counter_for_wifi == 20)
+    {
+      break;
+    }
+
+  }
+
+    //------------------------------------------------------- START NTP TIME
+// Initialize a NTPClient to get time
+  timeClient.begin();
+  // Set offset time in seconds to adjust for your timezone, for example:
+  // GMT +1 = 3600
+  // GMT +8 = 28800
+  // GMT -1 = -3600
+  // GMT 0 = 0
+  timeClient.setTimeOffset(10800);
+  //-------------------------------------------------------------------END NTP TIME
+}
+
+
+void loop() {
+  if(counter == 0 && WiFi.status() == WL_CONNECTED)
+  {
+    String pd = "id=" + String(2) + "&encrypted=" + String(1);
+    int CodeOne = SendData(pd);
+    if(CodeOne > 0)
+    {
+      counter = 1;
+    }
+    else
+    {
+      counter = 0;
+    }
+    int size_mas_old = sizeof(OldArrayKey);
+
+  // Перезапись значений array1 в array2 с помощью memcpy
+    memcpy(ArrayKey, OldArrayKey, size_mas_old);
+  }
+
+  if(WiFi.status() != WL_CONNECTED) {
+    counter = 0;
+  }
+
+  bool error_key = false;
+  int currentSecond = 10;
+  
+  
+  timeClient.update();
+
+  time_t epochTime = timeClient.getEpochTime();
+  //Serial.print("Epoch Time: ");
+  //Serial.println(epochTime);
+  int currentHour = timeClient.getHours();
+  //Serial.print("Hour: ");
+  //Serial.println(currentHour);  
+  int currentMinute = timeClient.getMinutes();
+  //Serial.print("Minutes: ");
+  //Serial.println(currentMinute); 
+  currentSecond = timeClient.getSeconds();
+  //Serial.print("Seconds: ");
+  //Serial.println(currentSecond);     
+  //Get a time structure
+  struct tm *ptm = gmtime ((time_t *)&epochTime); 
+  int monthDay = ptm->tm_mday;
+  //Serial.print("Month day: ");
+  //Serial.println(monthDay);
+  int currentMonth = ptm->tm_mon+1;
+  //Serial.print("Month: ");
+  //Serial.println(currentMonth);
+  int currentYear = ptm->tm_year+1900;
+  //Serial.print("Year: ");
+  //Serial.println(currentYear);
+  
+
+
+
+  if (!bme.performReading()) {        // Попытка считывания данных с датчика BME680
+    Serial.println("Data reading error");  // Вывод сообщения об ошибке
+  }
+  int temperature = bme.temperature;
+  int pressure = (bme.pressure / 100.0) *  0.7500637554192;
+  int humidity = bme.humidity;
+  int gas_resistance = bme.gas_resistance / 1000.0;
+  //
+
+
+
+  int LPG = mq2.readLPG();
+  int Methane = mq2.readMethane();
+  int Smoke = mq2.readSmoke();
+  int Hydrogen = mq2.readHydrogen();
+
+  int CryptedArrayToSend[LengthData];
+    // Создание массива для хранения разделенных значений
+  int ValuesForXor[LengthData];
+  String EncryptedWordToSend = "";
+
+  uint32_t checksum = calculateCodeChecksum();
+  uint32_t hashsum = hashFunction(checksum);
+  String Data = "T" + String(temperature) + "H" + String(humidity) + "P" + String(pressure) + "GR" + String(gas_resistance) + "S" + String(Smoke) + "C" + String(hashsum);
+  if(Data.length() != LengthData)
+  {
+    int a = LengthData - Data.length();
+    for(int i = 0; i < a; i++)
+    {
+      Data += " ";
+    }
+  }
+  Serial.println("Data= " + Data + "Len = " + String(Data.length()));
+  Serial.print("StrToInt :");
+
+
+  if(currentSecond == 0 || currentSecond == 30)
+  {
+    /*
+    Serial.print("Temp = ");    // Вывод сообщения о температуре
+    Serial.print(temperature);      // Вывод измеренной температуры
+    Serial.println(" *C");              // Вывод единиц измерения
+
+    Serial.print("Press = ");       // Вывод сообщения о давлении
+    Serial.print(pressure); 
+    Serial.println(" mm rt st");             // Вывод единицы измерения давления
+
+    Serial.print("Hum = ");      // Вывод сообщения о влажности
+    Serial.print(humidity);         // Вывод измеренной влажности
+    Serial.println(" %");               // Вывод единицы измерения влажности
+
+    Serial.print("Resistance Gas = ");            // Вывод сообщения о газовом сопротивлении
+    Serial.print(gas_resistance); // Вывод измеренного газового сопротивления (в килоомах)
+    Serial.println(" KOhms");                // Вывод единицы измерения газового сопротивления
+
+    Serial.print("LPG = ");
+    Serial.println(LPG);
+    Serial.print("Methane = ");
+    Serial.println(Methane);
+    Serial.print("Smoke = ");
+    Serial.println(Smoke);
+    Serial.print("Hydrogen = ");
+    Serial.println(Hydrogen);
+    */
+    mydelay = false;
+    Serial.println("Counter = " + String(counter));
+
+  }
+  else
+  {
+    mydelay = true;
+  }
+  
+//-----------------------------------Шифрование данных с датчиков------------------------------
+
+  if(counter == 1 && mydelay == false)
+  {
+ 
+             // Преобразование разделенных значений в числа и запись их в массив
+    for (int i = 0; i < LengthData; i++) {
+      ValuesForXor[i] = Data[i];
+      Serial.print(String(ValuesForXor[i]) + " ");
+    }
+    Serial.println(" ");
+
+    int counter_CryptedArrayToSend = 0;
+    // Выполняем операцию суммы по модулю 2
+    for (int i = 0; i < LengthData; i++) {
+      int num = ValuesForXor[i];
+      
+      int first = ArrayKey[counter_CryptedArrayToSend];
+      counter_CryptedArrayToSend++;
+      int second = ArrayKey[counter_CryptedArrayToSend];
+      counter_CryptedArrayToSend++;
+      int condition = first * 10 + second;
+      if(i == 0)
+      {
+       EncryptedWordToSend += + "0x" + String(num ^ condition, HEX);
+      }
+      else
+      {
+      EncryptedWordToSend += + " 0x" + String(num ^ condition, HEX);
+      }
+
+    }
+    Serial.println("Posle gammi: " + EncryptedWordToSend);
+    String postData = "id=" + String(1) + "&encrypted=" + String(EncryptedWordToSend);
+    int CodeSendData = SendData(postData);  //отправка
+    counter = 2;
+    delay(1000);
+
+  }
+
+  String fromGetTheKey = "";
+  if(currentSecond % 30 == 0 && counter == 2)
+  {
+    fromGetTheKey = GetTheKey();
+    if(fromGetTheKey != "yes" && fromGetTheKey != "1" && fromGetTheKey != "2" && fromGetTheKey != "error" )
+    {
+      new_get_key = fromGetTheKey;
+    }
+  }
+  if(fromGetTheKey.equals("error"))
+  {
+    error_key = true;
+  }
+  if(fromGetTheKey == "2" && error_key == false)
+  {
+    //String pd = "id=" + String(2) + "&encrypted=" + String("22");
+    //int CodeTwo = SendData(pd);
+    counter = 0;
+  }
+
+
+
+  if(OldKey != new_get_key && fromGetTheKey.length() > 5  &&  counter == 2 && error_key == false && mydelay == false) 
+  {
+    Serial.println("OldKey= " + OldKey);
+    Serial.println("new_get_key= " + new_get_key);
+
+      Serial.println("--------------------------VNUTRI!!!!---------------------------");
+
+    
+    int length_for_get_key = new_get_key.length() + 1;
+
+   // Создание массива символов с соответствующей длиной
+    char input[length_for_get_key];
+
+   // Копирование исходной строки в массив символов
+    new_get_key.toCharArray(input, length_for_get_key);
+    
+    //char input[] = "0x520x40x280x210x5c0x380x260x730x360x1c0x650xb0x340x70x7d0x750x1d0x27";
+
+    // Создание массива для хранения разделенных значений
+    uint8_t values[LengthDataKey];
+
+    // Разделение строки по символу '0x'
+    char *tokens[LengthDataKey];
+    char *pch = strtok(input, "0x");
+    int numTokens = 0;
+    while (pch != NULL) {
+      tokens[numTokens++] = pch;
+      pch = strtok(NULL, "0x");
+    }
+
+    // Преобразование разделенных значений в числа и запись их в массив
+    for (int i = 0; i < numTokens; i++) {
+      values[i] = (uint8_t)strtol(tokens[i], NULL, 16);
+      //Serial.println("Values[i]= " + String(values[i]));
+    }
+    
+
+    
+    // Печать содержимого массива
+    for (int i = 0; i < numTokens; i++) {
+      Serial.print(values[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+    
+    
+    int new_other[LengthDataKey];
+    int counter_other_mas = 0;
+    Serial.print("DECRYPTED KEY = ");
+    // Выполняем операцию суммы по модулю 2
+    for (int i = 0; i < LengthDataKey; i++) {
+      /*
+      int num = values[i];
+      int first = ArrayKey[counter_other_mas];
+      counter_other_mas++;
+      int second = ArrayKey[counter_other_mas];
+      counter_other_mas++;
+      int condition = first * 10 + second;
+      */
+      new_other[i] = values[i] ^ ArrayKey[i];
+
+    }
+    //Serial.println();
+    // Преобразуем значения обратно в символы
+    for (int i = 0; i < LengthDataKey; i++) {
+    //char ch = static_cast<char>(new_other[i]);
+      //Serial.print(ch);
+      ArrayKey[i] = new_other[i];
+      Serial.print(String(ArrayKey[i]) + " ");
+
+    }
+    String postData1 = "id=" + String(2) + "&encrypted=yes";
+
+    int CodeSend = SendData(postData1);
+    if(CodeSend > 0)
+    {
+      counter = 1;
+      OldKey = new_get_key;
+    }
+    delay(1000);
+    
+  }
+
+
+
+  if(counter_for_delay_oled < 3)
+  {
+    oled.clear();
+    // Отображаем иконку температуры
+    oled.drawBitmap(0, 0, image_data_temp, 64, 64);
+    // Отображаем значение температуры
+    oled.setCursor(70, 2);
+    oled.setScale(2);
+    oled.print(temperature, 1);
+    oled.print(" C");
+    if(temperature > 58)
+    {
+      oled.setCursor(50, 4);
+      oled.print("ОПАСНО!");
+    }
+    oled.update();
+  }
+  if(counter_for_delay_oled >= 3  && counter_for_delay_oled < 6)
+  {
+    //------------
+    oled.clear();
+
+    // Отображаем иконку влажности
+    oled.drawBitmap(0, 0, image_data_hum, 64, 64);
+
+    oled.setCursor(70, 2);
+    oled.setScale(2);
+    oled.print(humidity, 1);
+    oled.print(" %");
+
+    oled.update();
+  }
+  if(counter_for_delay_oled >= 6  && counter_for_delay_oled < 9)
+  {
+    //------------
+    oled.clear();
+
+    // Отображаем иконку давления
+    oled.drawBitmap(0, 0, image_data_press, 64, 64);
+
+    oled.setCursor(70, 2);
+    oled.setScale(2);
+    oled.print(pressure, 1);
+    oled.setCursor(70, 4);
+    oled.print("ММ РТ СТ");
+
+    oled.update();
+  }
+  if(counter_for_delay_oled >= 9  && counter_for_delay_oled < 12)
+  {
+    //------------
+    oled.clear();
+
+    // Отображаем иконку дыма
+    oled.drawBitmap(0, 0, image_data_smoke, 64, 64);
+
+    oled.setCursor(70, 2);
+    oled.setScale(2);
+    oled.print(Smoke, 1);
+    if(Smoke > 9)
+    {
+      oled.setCursor(70, 4);
+      oled.print("ppm");
+    }
+    else
+    {
+      oled.print(" ppm");
+    }
+    if(Smoke > 1000)
+    {
+      oled.setCursor(50, 6);
+      oled.print("ОПАСНО!");
+    }
+
+    oled.update();
+
+  }
+  if(counter_for_delay_oled >= 12)
+  {
+        //------------
+    oled.clear();
+
+    // Отображаем иконку загрязнения
+    oled.drawBitmap(0, 0, image_data_pollution, 64, 64);
+
+    oled.setCursor(70, 2);
+    oled.setScale(2);
+    oled.print(gas_resistance, 1);
+    if(gas_resistance > 9)
+    {
+      oled.setCursor(70, 4);
+      oled.print("IAQ");
+    }
+    else
+    {
+      oled.print("IAQ");
+    }
+    if(gas_resistance > 500)
+    {
+      oled.setCursor(50, 6);
+      oled.print("ОПАСНО!");
+    }
+    if(gas_resistance > 300)
+    {
+      oled.setCursor(50, 6);
+      oled.print("ВРЕДНО!");
+    }
+    
+    oled.update();
+    if(counter_for_delay_oled == 15)
+    {
+      counter_for_delay_oled = 0;
+    }
+  }
+
+  delay(500);
+  counter_for_delay_oled++;
+  Serial.println("counter_for_delay_oled= " + String(counter_for_delay_oled));
+
+
+}
+
+int SendData(String postData)
+{
+  
+  HTTPClient http;
+  http.begin(urlSend);
+  http.addHeader("Content-type", "application/x-www-form-urlencoded");
+
+  int httpCode = http.POST(postData);
+  String payload = http.getString();
+  Serial.println("URL = " + String(urlSend));
+  Serial.println("Data = " + String(postData));
+  Serial.println("httpCode = " + String(httpCode));
+  Serial.println("payload = " + String(payload));
+  Serial.println("--------------------------------");
+  return httpCode;
+}
+
+String GetTheKey()
+{
+    String en_cryp_key = "error";
+
+      // Создать объект HTTP-клиента
+    HTTPClient http;
+
+    // Установить адрес сервера и путь к PHP-скрипту
+    http.begin(urlGet);
+
+    // Отправить GET-запрос с параметром "id"
+    int id = 2;
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String data = "id=" + String(id);
+    int httpCode = http.POST(data);
+
+    // Проверить код ответа HTTP
+    if (httpCode > 0) {
+        // Получить тело ответа
+        String payload = http.getString();
+
+        // Преобразовать тело ответа в JSON-объект
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+            Serial.println("Ошибка десериализации JSON");
+            return "error";
+        }
+
+        // Получить данные из JSON-объекта
+        int id = doc["id"];
+        String xex = doc["encrypted"];
+        en_cryp_key = xex;
+
+        // Вывести данные в последовательный порт
+        Serial.println("Полученные данные:");
+        Serial.println("id: " + String(id));
+        Serial.println("encrypted_key: " + String(en_cryp_key));
+        return en_cryp_key;
+    } else {
+        Serial.println("Ошибка отправки запроса");
+        en_cryp_key = "error";
+    }
+
+    // Закрыть соединение HTTP
+    http.end();
+    return en_cryp_key;
+
+    // Задержка перед следующим запросом
+}
+
+
+// Функция для вычисления  контрольной суммы
+uint32_t calculateCodeChecksum() {
+    const esp_partition_t* partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    if (partition == NULL) {
+        Serial.println("Failed to find partition");
+        return 0;
+    }
+
+    const size_t bufferSize = 4096; // Размер буфера для чтения памяти
+    uint8_t buffer[bufferSize];
+    uint32_t checksum = 0;
+    size_t offset = 0;
+
+    while (offset < partition->size) {
+        size_t readSize = (partition->size - offset < bufferSize) ? partition->size - offset : bufferSize;
+        esp_err_t result = esp_partition_read(partition, offset, buffer, readSize);
+        if (result != ESP_OK) {
+            Serial.printf("Failed to read partition: %s\n", esp_err_to_name(result));
+            return 0;
+        }
+
+        for (size_t i = 0; i < readSize; i++) {
+            checksum += buffer[i];
+        }
+        offset += readSize;
+    }
+
+    return checksum;
+}
+
+int hashFunction(uint32_t input) {
+    int mod = 97; // Используем простое число для деления, чтобы уменьшить вероятность коллизий
+    return input % mod;
+}
+
